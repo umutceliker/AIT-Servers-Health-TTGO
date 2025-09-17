@@ -48,6 +48,20 @@
 // AP portal parolası
 #define WIFI_PORTAL_AP_PASS "12345678"
 
+// Debug log seviyeleri
+#define LOG_LEVEL_NONE 0
+#define LOG_LEVEL_ERROR 1  
+#define LOG_LEVEL_INFO 2
+#define LOG_LEVEL_DEBUG 3
+
+// Mevcut log seviyesi (değiştirilebilir)
+#define CURRENT_LOG_LEVEL LOG_LEVEL_INFO
+
+// Log makroları
+#define LOG_ERROR(msg) if(CURRENT_LOG_LEVEL >= LOG_LEVEL_ERROR) Serial.print("[ERROR] "), Serial.println(msg)
+#define LOG_INFO(msg) if(CURRENT_LOG_LEVEL >= LOG_LEVEL_INFO) Serial.print("[INFO] "), Serial.println(msg)
+#define LOG_DEBUG(msg) if(CURRENT_LOG_LEVEL >= LOG_LEVEL_DEBUG) Serial.print("[DEBUG] "), Serial.println(msg)
+
 String apName() {
   char b[32];
   sprintf(b,"Kuma-Relay-%06X",(uint32_t)(ESP.getEfuseMac() & 0xFFFFFF));
@@ -215,6 +229,16 @@ struct OutputState {
   uint8_t channel=255;
   uint8_t duty=0;
   bool digitalHigh=false;
+  // Animasyon özellikleri
+  bool isAnimating=false;
+  String animationType="none"; // "blink", "fade", "pulse"
+  unsigned long animationInterval=1000; // ms
+  unsigned long lastAnimationUpdate=0;
+  bool animationDirection=true; // true=yukarı, false=aşağı
+  uint16_t animationMin=0;
+  uint16_t animationMax=1023;
+  uint16_t animationStep=50;
+  uint16_t currentAnimationValue=0;
 };
 OutputState states[40];
 
@@ -242,6 +266,13 @@ void ensurePinInit(uint8_t gpio){
   }
 }
 void applyDigital(uint8_t gpio, bool high){
+  // Sadece önemli değişikliklerde log
+  static bool lastStates[40] = {false};
+  if (lastStates[gpio] != high) {
+    LOG_DEBUG("Digital GPIO" + String(gpio) + " -> " + (high ? "HIGH" : "LOW"));
+    lastStates[gpio] = high;
+  }
+  
   ensurePinInit(gpio);
   if(states[gpio].channel!=255){
     ledcDetach(gpio);
@@ -252,12 +283,99 @@ void applyDigital(uint8_t gpio, bool high){
   digitalWrite(gpio, high?HIGH:LOW);
 }
 void applyPwm(uint8_t gpio, uint16_t value0_1023){
+  // Sadece önemli değişikliklerde log (>10% değişim)
+  static uint16_t lastValues[40] = {9999}; // Başlangıç değeri geçersiz
+  uint16_t diff = abs((int)lastValues[gpio] - (int)value0_1023);
+  if (lastValues[gpio] == 9999 || diff > 100) { // >10% değişim
+    LOG_DEBUG("PWM GPIO" + String(gpio) + " -> " + String(value0_1023) + "/1023");
+    lastValues[gpio] = value0_1023;
+  }
+  
   ensurePinInit(gpio);
-  if(!pinSupportsPwm(gpio)){ applyDigital(gpio, value0_1023>=512); return; }
+  if(!pinSupportsPwm(gpio)){ 
+    LOG_DEBUG("Pin doesn't support PWM, falling back to digital");
+    applyDigital(gpio, value0_1023>=512); 
+    return; 
+  }
   uint8_t duty = (uint8_t)map((int)value0_1023,0,1023,0,255);
   allocChannelFor(gpio); // LEDC channel'ı hazırla
   states[gpio].isPwm=true; states[gpio].duty=duty;
   ledcWrite(gpio, duty);
+}
+
+// Animasyon fonksiyonları
+void startAnimation(uint8_t gpio, const String& type, unsigned long interval, uint16_t minVal, uint16_t maxVal, uint16_t step){
+  if(gpio>39) return;
+  states[gpio].isAnimating = true;
+  states[gpio].animationType = type;
+  states[gpio].animationInterval = interval;
+  states[gpio].animationMin = minVal;
+  states[gpio].animationMax = maxVal;
+  states[gpio].animationStep = step;
+  states[gpio].currentAnimationValue = minVal;
+  states[gpio].animationDirection = true;
+  states[gpio].lastAnimationUpdate = millis();
+  
+  LOG_INFO("Animation started GPIO" + String(gpio) + " - " + type + ", " + String(interval) + "ms");
+}
+
+void stopAnimation(uint8_t gpio){
+  if(gpio>39) return;
+  if(states[gpio].isAnimating) { // Sadece çalışıyorsa log
+    LOG_INFO("Animation stopped GPIO" + String(gpio));
+  }
+  states[gpio].isAnimating = false;
+  states[gpio].animationType = "none";
+}
+
+void processAnimations(){
+  unsigned long currentTime = millis();
+  
+  for(uint8_t gpio=0; gpio<40; gpio++){
+    if(!states[gpio].isAnimating) continue;
+    
+    if(currentTime - states[gpio].lastAnimationUpdate >= states[gpio].animationInterval){
+      states[gpio].lastAnimationUpdate = currentTime;
+      
+      if(states[gpio].animationType == "blink"){
+        // Digital blink (0/1 arası geçiş)
+        states[gpio].digitalHigh = !states[gpio].digitalHigh;
+        applyDigital(gpio, states[gpio].digitalHigh);
+        
+      } else if(states[gpio].animationType == "fade"){
+        // PWM fade (smooth geçiş)
+        if(states[gpio].animationDirection){
+          states[gpio].currentAnimationValue += states[gpio].animationStep;
+          if(states[gpio].currentAnimationValue >= states[gpio].animationMax){
+            states[gpio].currentAnimationValue = states[gpio].animationMax;
+            states[gpio].animationDirection = false;
+          }
+        } else {
+          if(states[gpio].currentAnimationValue >= states[gpio].animationStep){
+            states[gpio].currentAnimationValue -= states[gpio].animationStep;
+          } else {
+            states[gpio].currentAnimationValue = states[gpio].animationMin;
+          }
+          if(states[gpio].currentAnimationValue <= states[gpio].animationMin){
+            states[gpio].currentAnimationValue = states[gpio].animationMin;
+            states[gpio].animationDirection = true;
+          }
+        }
+        applyPwm(gpio, states[gpio].currentAnimationValue);
+        
+      } else if(states[gpio].animationType == "pulse"){
+        // PWM pulse (hızlı fade)
+        if(states[gpio].animationDirection){
+          states[gpio].currentAnimationValue = states[gpio].animationMax;
+          states[gpio].animationDirection = false;
+        } else {
+          states[gpio].currentAnimationValue = states[gpio].animationMin;
+          states[gpio].animationDirection = true;
+        }
+        applyPwm(gpio, states[gpio].currentAnimationValue);
+      }
+    }
+  }
 }
 
 // Config (LittleFS:/config.json)
@@ -359,7 +477,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 <title>Kuma → ESP32 GPIO</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
 <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
-<style>body{background:#0e1117;color:#e6edf3}.card{background:#161b22;border-color:#30363d}.form-select,.form-control{background:#0d1117;color:#e6edf3;border-color:#30363d}.btn-primary{background:#238636;border-color:#238636}.btn-outline-secondary{color:#c9d1d9;border-color:#30363d}code{color:#abb2bf}</style>
+<style>body{background:#0e1117;color:#e6edf3}.card{background:#161b22;border-color:#30363d;color: cornsilk;}.form-select,.form-control{background:#0d1117;color:#e6edf3;border-color:#30363d}.form-text{color: inherit;}.btn-primary{background:#238636;border-color:#238636}.btn-outline-secondary{color:#c9d1d9;border-color:#30363d}code{color:#abb2bf}.table{font-size:0.85rem}.table-responsive{max-height:600px;overflow-y:auto}.form-control-sm,.form-select-sm{font-size:0.75rem;padding:0.2rem 0.4rem}.small{font-size:0.7rem}.text-muted{color:#8b949e!important}.animation-row{background:#1c2128!important;border-top:1px solid #30363d}.animation-controls{padding:0.5rem;font-size:0.75rem}</style>
 </head><body><div class="container py-4">
 <div class="d-flex align-items-center justify-content-between mb-3">
   <h1 class="h5 m-0"><i class="bi bi-hdd-network"></i> Kuma → ESP32 GPIO</h1>
@@ -428,6 +546,31 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 }</code></pre>
       </div>
     </div>
+    <div class="card mt-3"><div class="card-header"><strong>📋 Animasyon Kullanım Örnekleri</strong></div>
+      <div class="card-body small">
+        <div class="mb-3">
+          <strong>🔴 Yanıp Sönen LED (Blink):</strong><br>
+          ✅ Anim işaretli<br>
+          Type: <code>Blink</code><br>
+          ms: <code>1000</code> (1 saniyede bir)<br>
+          Min: <code>0</code>, Max: <code>1</code>, Step: <code>1</code>
+        </div>
+        <div class="mb-3">
+          <strong>🌅 Fade Efekti (PWM):</strong><br>
+          ✅ Anim işaretli<br>
+          Type: <code>Fade</code><br>
+          ms: <code>50</code> (yumuşak geçiş)<br>
+          Min: <code>0</code>, Max: <code>1023</code>, Step: <code>20</code>
+        </div>
+        <div class="mb-0">
+          <strong>⚡ Hızlı Pulse (Uyarı):</strong><br>
+          ✅ Anim işaretli<br>
+          Type: <code>Pulse</code><br>
+          ms: <code>300</code> (hızlı nabız)<br>
+          Min: <code>0</code>, Max: <code>800</code>, Step: <code>100</code>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 </div>
@@ -467,9 +610,61 @@ void evaluateRules(const KumaCtx& ctx){
     int val=act["value"].is<int>()?act["value"].as<int>():1;
     String ebeh=els["behavior"]|"nochange";
     int eval=els["value"].is<int>()?els["value"].as<int>():0;
+    
+    // Debug JSON parsing (sadece DEBUG seviyesinde)
+    LOG_DEBUG("Rule parsing - Pin: " + label + ", GPIO: " + String(gpio) + 
+              ", Mode: " + mode + ", Value: " + String(val));
+    
+    // Animasyon parametreleri
+    JsonObject anim = act["animation"];
+    bool hasAnimation = false;
+    
+    // Animasyon enable kontrolü - sadece animation objesi varsa ve enable true ise
+    if(!anim.isNull() && anim.containsKey("enable") && anim["enable"].as<bool>()) {
+      hasAnimation = true;
+    }
+    
+    LOG_DEBUG("GPIO" + String(gpio) + " Animation check: hasAnimation=" + (hasAnimation ? "true" : "false"));
+    
     bool ok=matchCondition(cond,ctx);
-    if(ok){ if(mode=="digital") applyDigital(gpio, val!=0); else applyPwm(gpio, (uint16_t)constrain(val,0,1023)); }
-    else  { applyElse(gpio, mode, ebeh, eval); }
+    if(ok){ 
+      if(hasAnimation){
+        // Animasyon modunda
+        String animType = anim["type"].as<String>();
+        unsigned long animInterval = anim["interval"].as<unsigned long>();
+        uint16_t animMin = anim["minValue"].as<uint16_t>();
+        uint16_t animMax = anim["maxValue"].as<uint16_t>();
+        uint16_t animStep = anim["step"].as<uint16_t>();
+        
+        if(animType == "" || animInterval == 0) animType = "blink", animInterval = 1000;
+        if(animMin == animMax) animMin = 0, animMax = (mode=="digital") ? 1 : 1023;
+        if(animStep == 0) animStep = (mode=="digital") ? 1 : 50;
+        
+        LOG_DEBUG("Starting animation - Type: " + animType + ", Interval: " + 
+                 String(animInterval) + "ms, Range: " + String(animMin) + "-" + String(animMax));
+        
+        startAnimation(gpio, animType, animInterval, animMin, animMax, animStep);
+      } else {
+        // Normal mod - animasyonu durdur
+        LOG_INFO("Normal mode GPIO" + String(gpio) + " - " + mode + ", Value: " + String(val));
+        
+        stopAnimation(gpio);
+        if(mode=="digital") {
+          LOG_INFO("Applying Digital: GPIO" + String(gpio) + " = " + (val!=0 ? "HIGH" : "LOW"));
+          applyDigital(gpio, val!=0);
+        } else {
+          uint16_t pwmValue = (uint16_t)constrain(val,0,1023);
+          LOG_INFO("Applying PWM: GPIO" + String(gpio) + " = " + String(pwmValue) + "/1023");
+          applyPwm(gpio, pwmValue);
+        }
+      }
+    } else {
+      // Else durumu - animasyonu durdur
+      LOG_DEBUG("Else condition GPIO" + String(gpio) + " - Behavior: " + ebeh);
+      
+      stopAnimation(gpio);
+      applyElse(gpio, mode, ebeh, eval);
+    }
   }
 }
 
@@ -497,31 +692,100 @@ void handleTest(){
 void handleKuma(){
   if(server.method()!=HTTP_POST){ server.send(405,"text/plain","Method Not Allowed"); return; }
   if(!server.hasArg("plain")){ server.send(400,"text/plain","No body"); return; }
+  
+  // Webhook geldi
+  String webhookBody = server.arg("plain");
+  LOG_INFO("=== KUMA WEBHOOK RECEIVED ===");
+  LOG_DEBUG("Raw JSON: " + webhookBody);
+  
   StaticJsonDocument<4096> d;
-  if(deserializeJson(d, server.arg("plain"))){ server.send(400,"text/plain","Bad JSON"); return; }
+  if(deserializeJson(d, webhookBody)){ 
+    LOG_ERROR("Bad JSON received!");
+    server.send(400,"text/plain","Bad JSON"); 
+    return; 
+  }
+  
   KumaCtx c;
   c.status = d["heartbeat"]["status"].is<int>()? d["heartbeat"]["status"].as<int>() : -1;
   c.monitorId = (const char*)(d["monitor"]["id"] | "");
   c.monitorName= (const char*)(d["monitor"]["name"] | "");
+  
+  // Ana bilgileri logla
+  String statusStr = (c.status==0?"DOWN":c.status==1?"UP":c.status==2?"PENDING":"MAINTENANCE");
+  LOG_INFO("Monitor: " + c.monitorName + " [" + c.monitorId + "] -> " + statusStr);
+  
+  // Ek bilgiler DEBUG seviyesinde
+  if(d["msg"]) {
+    LOG_DEBUG("Message: " + String((const char*)d["msg"]));
+  }
+  if(d["heartbeat"]["time"]) {
+    LOG_DEBUG("Heartbeat Time: " + String((const char*)d["heartbeat"]["time"]));
+  }
+  
+  // Kuralları uygula
+  LOG_DEBUG("Applying rules...");
   evaluateRules(c);
+  LOG_DEBUG("Rules applied successfully");
+  
   server.send(200,"application/json","{\"ok\":true}");
+  
   #if USE_TFT
     if (displayOn) {
-      // Kuma durumunu ekranda göster (geçici olarak)
-      tft.fillRect(0, 140, 240, 25, TFT_BLACK);
-      tft.setCursor(0, 140);
-      tft.setTextSize(1);
-      tft.setTextColor((c.status==0)?TFT_RED:(c.status==1)?TFT_GREEN:TFT_YELLOW);
-      tft.print("Kuma: ");
-      tft.print(c.status==0?"DOWN":c.status==1?"UP":c.status==2?"PEND":"MAINT");
-      tft.print(" - ");
-      tft.print(c.monitorName.c_str());
+      // Ekranı temizle ve webhook bilgilerini göster
+      tft.fillScreen(TFT_BLACK);
       
-      // 3 saniye sonra normal ekranı göster
-      delay(3000);
+      // Başlık
+      tft.setTextColor(TFT_CYAN, TFT_BLACK);
+      tft.setTextSize(2);
+      tft.setCursor(0, 0);
+      tft.println("WEBHOOK RECEIVED");
+      
+      // Monitor bilgileri
+      tft.setTextSize(1);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.setCursor(0, 25);
+      tft.print("Monitor: ");
+      tft.println(c.monitorName.c_str());
+      
+      tft.setCursor(0, 40);
+      tft.print("ID: ");
+      tft.println(c.monitorId.c_str());
+      
+      // Status bilgisi (renkli)
+      tft.setCursor(0, 55);
+      tft.setTextColor((c.status==0)?TFT_RED:(c.status==1)?TFT_GREEN:TFT_YELLOW, TFT_BLACK);
+      tft.setTextSize(2);
+      tft.print("STATUS: ");
+      tft.println(c.status==0?"DOWN":c.status==1?"UP":c.status==2?"PEND":"MAINT");
+      
+      // Zaman bilgisi
+      tft.setTextColor(TFT_MAGENTA, TFT_BLACK);
+      tft.setTextSize(1);
+      tft.setCursor(0, 85);
+      tft.print("Time: ");
+      tft.print(millis() / 1000);
+      tft.println("s");
+      
+      // Mesaj varsa göster
+      if(d["msg"]) {
+        tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+        tft.setCursor(0, 100);
+        tft.print("Msg: ");
+        tft.println((const char*)d["msg"]);
+      }
+      
+      // Alt bilgi
+      tft.setTextColor(0x7BEF, TFT_BLACK); // Gri renk (RGB565 format)
+      tft.setCursor(0, 120);
+      tft.println("Returning to main in 5s...");
+      
+      // 5 saniye bekle sonra normal ekranı göster
+      delay(5000);
       updateDisplay();
     }
   #endif
+  
+  LOG_INFO("=== WEBHOOK PROCESSING COMPLETE ===");
 }
 // Wi-Fi yardımcıları
 void handleWifiPortal(){ server.send(200,"text/plain","Reboot + Portal..."); delay(300); WiFi.disconnect(true,true); ESP.restart(); }
@@ -581,6 +845,56 @@ function ruleRow(rule,idx){
   const inpVal=el('input',{class:'form-control form-control-sm',placeholder:'digital:0/1, pwm:0-1023'}); 
   inpVal.value=rule.action?.value??1;
   
+  // Animasyon seçenekleri - detaylı
+  const animDiv=el('div',{class:'d-flex flex-column gap-1',style:'min-width:200px'});
+  const chkAnim=el('input',{type:'checkbox',class:'form-check-input',id:`anim_${idx}`});
+  chkAnim.checked=rule.action?.animation?.enable||false;
+  
+  const selAnimType=el('select',{class:'form-select form-select-sm',style:'width:80px'});
+  [['blink','Blink'],['fade','Fade'],['pulse','Pulse']].forEach(([v,t])=>{
+    const o=el('option',{value:v});o.textContent=t;selAnimType.appendChild(o);
+  });
+  selAnimType.value=rule.action?.animation?.type||'blink';
+  selAnimType.disabled=!chkAnim.checked;
+  
+  const inpAnimInterval=el('input',{type:'number',class:'form-control form-control-sm',placeholder:'ms',style:'width:70px',min:'100',max:'10000'});
+  inpAnimInterval.value=rule.action?.animation?.interval||1000;
+  inpAnimInterval.disabled=!chkAnim.checked;
+  
+  const inpAnimMin=el('input',{type:'number',class:'form-control form-control-sm',placeholder:'Min',style:'width:60px',min:'0',max:'1023'});
+  inpAnimMin.value=rule.action?.animation?.minValue||0;
+  inpAnimMin.disabled=!chkAnim.checked;
+  
+  const inpAnimMax=el('input',{type:'number',class:'form-control form-control-sm',placeholder:'Max',style:'width:60px',min:'0',max:'1023'});
+  inpAnimMax.value=rule.action?.animation?.maxValue||(rule.action?.mode==='digital'?1:1023);
+  inpAnimMax.disabled=!chkAnim.checked;
+  
+  const inpAnimStep=el('input',{type:'number',class:'form-control form-control-sm',placeholder:'Step',style:'width:60px',min:'1',max:'100'});
+  inpAnimStep.value=rule.action?.animation?.step||(rule.action?.mode==='digital'?1:50);
+  inpAnimStep.disabled=!chkAnim.checked;
+  
+  // İlk satır - Enable ve Type
+  const animRow1=el('div',{class:'d-flex gap-1 align-items-center'},[
+    chkAnim,
+    el('label',{class:'form-check-label small',for:`anim_${idx}`,style:'width:35px'},[document.createTextNode('Anim')]),
+    selAnimType
+  ]);
+  
+  // İkinci satır - Interval, Min, Max, Step
+  const animRow2=el('div',{class:'d-flex gap-1 align-items-center'},[
+    el('span',{class:'small text-muted',style:'width:35px'},[document.createTextNode('ms:')]),
+    inpAnimInterval,
+    el('span',{class:'small text-muted'},[document.createTextNode('Min:')]),
+    inpAnimMin,
+    el('span',{class:'small text-muted'},[document.createTextNode('Max:')]),
+    inpAnimMax,
+    el('span',{class:'small text-muted'},[document.createTextNode('Step:')]),
+    inpAnimStep
+  ]);
+  
+  animDiv.appendChild(animRow1);
+  animDiv.appendChild(animRow2);
+  
   const selElse=el('select',{class:'form-select form-select-sm'}); 
   [['nochange','NoChange'],['off','Off'],['value','Value']].forEach(([v,t])=>{
     const o=el('option',{value:v});o.textContent=t;selElse.appendChild(o);
@@ -618,6 +932,23 @@ function ruleRow(rule,idx){
   selPin.onchange=()=>{rule.action=rule.action||{}; rule.action.pin=selPin.value;};
   selMode.onchange=()=>{rule.action=rule.action||{}; rule.action.mode=selMode.value;};
   inpVal.oninput=()=>{rule.action=rule.action||{}; rule.action.value=Number(inpVal.value);};
+  
+  // Animasyon event handlers
+  chkAnim.onchange=()=>{
+    rule.action=rule.action||{}; rule.action.animation=rule.action.animation||{};
+    rule.action.animation.enable=chkAnim.checked;
+    selAnimType.disabled=!chkAnim.checked;
+    inpAnimInterval.disabled=!chkAnim.checked;
+    inpAnimMin.disabled=!chkAnim.checked;
+    inpAnimMax.disabled=!chkAnim.checked;
+    inpAnimStep.disabled=!chkAnim.checked;
+  };
+  selAnimType.onchange=()=>{rule.action=rule.action||{}; rule.action.animation=rule.action.animation||{}; rule.action.animation.type=selAnimType.value;};
+  inpAnimInterval.oninput=()=>{rule.action=rule.action||{}; rule.action.animation=rule.action.animation||{}; rule.action.animation.interval=Number(inpAnimInterval.value);};
+  inpAnimMin.oninput=()=>{rule.action=rule.action||{}; rule.action.animation=rule.action.animation||{}; rule.action.animation.minValue=Number(inpAnimMin.value);};
+  inpAnimMax.oninput=()=>{rule.action=rule.action||{}; rule.action.animation=rule.action.animation||{}; rule.action.animation.maxValue=Number(inpAnimMax.value);};
+  inpAnimStep.oninput=()=>{rule.action=rule.action||{}; rule.action.animation=rule.action.animation||{}; rule.action.animation.step=Number(inpAnimStep.value);};
+  
   selElse.onchange=()=>{rule.else=rule.else||{}; rule.else.behavior=selElse.value;};
   inpElseVal.oninput=()=>{rule.else=rule.else||{}; rule.else.value=Number(inpElseVal.value);};
   
@@ -631,13 +962,24 @@ function ruleRow(rule,idx){
     el('td',{},[el('div',{class:'d-flex gap-1'},[selElse,inpElseVal])]), 
     el('td',{},[el('div',{class:'d-flex'},[btnUp,btnDn,btnDel])])
   );
-  return tr;
+  
+  // Animasyon satırı (ayrı tr)
+  const animTr = el('tr',{class:'animation-row'});
+  const animTd = el('td',{colspan:'8',class:'animation-controls'});
+  animTd.appendChild(animDiv);
+  animTr.appendChild(animTd);
+  
+  return [tr, animTr];
 }
 
 function renderRules(){ 
   const tb=document.querySelector('#rulesTable tbody'); 
   tb.innerHTML=''; 
-  config.rules.forEach((r,i)=>tb.appendChild(ruleRow(r,i))); 
+  config.rules.forEach((r,i)=>{
+    const [mainRow, animRow] = ruleRow(r,i);
+    tb.appendChild(mainRow);
+    tb.appendChild(animRow);
+  }); 
   document.getElementById('pwmFreq').value=config.pwm?.freq??1000; 
 }
 
@@ -652,7 +994,19 @@ async function loadConfig(){
 function addRule(){ 
   config.rules.push({
     condition:{type:'status',value:'down'}, 
-    action:{pin:pins[0]?.label||'IO2',mode:'digital',value:1}, 
+    action:{
+      pin:pins[0]?.label||'IO2',
+      mode:'digital',
+      value:1,
+      animation:{
+        enable:false,
+        type:'blink',
+        interval:1000,
+        minValue:0,
+        maxValue:1,
+        step:1
+      }
+    }, 
     else:{behavior:'nochange'}
   }); 
   renderRules(); 
@@ -825,7 +1179,7 @@ void setup(){
     Serial.println("Test text drawn");
   #endif
   
-  Serial.println("Setup completed - entering loop()");
+  Serial.println("Setup completed - listening for webhooks");
   Serial.println("=================================");
 }
 
@@ -833,23 +1187,26 @@ void loop(){
   // İlk loop çağrısını göster
   static bool firstLoop = true;
   if (firstLoop) {
-    Serial.println("*** FIRST LOOP CALL - Loop is working! ***");
+    Serial.println("*** Listening for webhooks ***");
     firstLoop = false;
   }
+  
+  // Animasyonları işle (en üstte olmalı)
+  processAnimations();
   
   #if USE_TFT
     // Butonları kontrol et
     handleButtons();
     
     // Debug: Her 10 saniyede loop durumunu yazdır (azaltıldı)
-    static unsigned long lastDebug = 0;
-    if (millis() - lastDebug > 10000) {
-      Serial.print("System OK - Uptime: ");
-      Serial.print(millis() / 1000);
-      Serial.print("s, WiFi: ");
-      Serial.println(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
-      lastDebug = millis();
-    }
+    // static unsigned long lastDebug = 0;
+    // if (millis() - lastDebug > 10000) {
+    //   Serial.print("System OK - Uptime: ");
+    //   Serial.print(millis() / 1000);
+    //   Serial.print("s, WiFi: ");
+    //   Serial.println(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
+    //   lastDebug = millis();
+    // }
     
     // Ekranı belirli aralıklarla güncelle
     if (displayOn && millis() - lastDisplayUpdate > DISPLAY_UPDATE_INTERVAL) {
